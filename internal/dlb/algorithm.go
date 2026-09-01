@@ -11,24 +11,28 @@ import (
 // - evses: Map ของหัวชาร์จทั้งหมดที่มีในระบบ (Key: "SN_ConnectorID" เช่น "CS-SIEMENS_1")
 func CalculateDLB(building BuildingCapacity, box ENBox, evses map[string]*EVSE) DLBResult {
 	fmt.Printf("%v\n", evses)
-	var activeTargets []*EVSE
+
+	// 🎯 เก็บทั้ง key และ evse คู่กัน (เดิมเก็บแค่ *EVSE เฉยๆ ทำให้ตอน redistribute ไม่รู้ key เต็ม)
+	type target struct {
+		key  string
+		evse *EVSE
+	}
+	var activeTargets []target
 
 	fmt.Printf("🔹 [DLB] คำนวณ DLB สำหรับ Box: %s, NowAmp: %.2fA, Building MaxAmp: %.2fA\n", box.AddressEsp32, box.NowAmp, building.MaxAmperes)
 
 	// 1. ค้นหาหัวชาร์จเป้าหมายที่อยู่ในสถานะ Charging
-	// 🎯 แก้ไข: เปลี่ยนมาวนลูปค้นหาจาก map evses โดยตรง เพื่อให้เจอทุก Connector ของตู้ (ไม่ใช่แค่ _1)
 	for key, evse := range evses {
-		// เช็คว่าหัวชาร์จนี้เป็นของกล่องนี้หรือไม่
 		isMyBox := false
 		for _, idEvse := range box.IDEVSE {
-			if evse.SerialNumber == idEvse || key == idEvse {
+			if evse.SerialNumber == idEvse.Name || key == idEvse.Name {
 				isMyBox = true
 				break
 			}
 		}
 
 		if isMyBox && evse.Status == StatusCharging {
-			activeTargets = append(activeTargets, evse)
+			activeTargets = append(activeTargets, target{key: key, evse: evse})
 		}
 	}
 
@@ -37,7 +41,6 @@ func CalculateDLB(building BuildingCapacity, box ENBox, evses map[string]*EVSE) 
 
 	fmt.Printf("🔹 [DLB] จำนวนหัวชาร์จที่กำลังชาร์จ: %d activeTargets: %v\n", activeCount, activeTargets)
 
-	// ถ้าไม่มีรถกำลังชาร์จ คืนค่า 0 ทั้งหมด
 	if activeCount == 0 {
 		return DLBResult{
 			Allocations:    allocations,
@@ -45,58 +48,94 @@ func CalculateDLB(building BuildingCapacity, box ENBox, evses map[string]*EVSE) 
 		}
 	}
 
-	// 2. คำนวณไฟหารเฉลี่ยตามจำนวนหัวชาร์จที่กำลังทำงาน (Math.floor(newNowAmp / activeCount))
-	// ใช้วิธีนำค่าต่ำสุดระหว่าง กระแสไฟอาคาร (building.MaxAmperes) กับ กระแสไฟกล่อง (box.NowAmp)
-	availableAmp := (building.MaxAmperes * 0.8) - box.NowAmp // ลดลง 20% เพื่อเผื่อความปลอดภัย
+	availableAmp := (building.MaxAmperes * 0.8) - box.NowAmp
 	if availableAmp < 0 {
 		availableAmp = 0
 	}
 
-	allocatedAmps := math.Floor(availableAmp / float64(activeCount))
+	fmt.Printf("🔹 [DLB] ไฟคงเหลือสำหรับ EV ทั้งหมด: %.2fA | จำนวนหัวที่ชาร์จ: %d\n", availableAmp, activeCount)
 
-	fmt.Printf("🔹 [DLB] ไฟคงเหลือสำหรับ EV: %.2fA | จำนวนหัวที่ชาร์จ: %d | เกลี่ยได้หัวละ: %.2fA\n", availableAmp, activeCount, allocatedAmps)
+	// 🎯 ==========================================
+	// 🎯 Water-Filling: เกลี่ยไฟแบบวนซ้ำ
+	// 🎯 หัวไหนติด MaxAmp (รับไม่หมดตามส่วนแบ่งเฉลี่ย) จะถูกตรึงไว้ที่ MaxAmp ของตัวเอง
+	// 🎯 แล้วเอาไฟส่วนที่เหลือ (ไม่ได้ใช้) ไปหารเฉลี่ยใหม่ให้เฉพาะหัวที่ยังไม่ถูกตรึง
+	// 🎯 วนจนกว่าจะไม่มีใครติด cap อีก หรือไฟหมด
+	// 🎯 ==========================================
+	finalAmps := make(map[string]float64) // key -> แอมป์ที่ตรึงแล้ว (final)
+	pending := activeTargets              // หัวที่ยังไม่ถูกตรึง
+	remainingAmp := availableAmp
 
-	// 3. กติกาที่ 1: ถ้าไฟหารได้เกินกว่า MaxAmperes ที่ EVSE/Box รับได้ -> ปรับลงเท่า MaxAmperes
-	// (ใช้ MaxAmperes ของหัวชาร์จแต่ละหัวในการ cap ขีดจำกัด)
+	for len(pending) > 0 {
+		share := math.Floor(remainingAmp / float64(len(pending)))
 
-	// 4. กติกาที่ 2: ถ้าไฟหารได้ต่ำกว่า 6A -> ปรับเป็น 0A (สั่ง Pause)
-	if allocatedAmps < 6.0 {
-		allocatedAmps = 0.0
+		var stillPending []target
+		cappedAny := false
+
+		for _, t := range pending {
+			maxAmp := t.evse.MaxAmperes
+			if maxAmp > 0 && share > maxAmp {
+				// หัวนี้รับได้ไม่ถึงส่วนแบ่งเฉลี่ย -> ตรึงไว้ที่ MaxAmp ของมัน
+				finalAmps[t.key] = maxAmp
+				remainingAmp -= maxAmp
+				cappedAny = true
+			} else {
+				stillPending = append(stillPending, t)
+			}
+		}
+
+		if remainingAmp < 0 {
+			remainingAmp = 0
+		}
+
+		if !cappedAny {
+			// ไม่มีใครติด cap แล้ว -> แจก share เท่ากันให้ทุกหัวที่เหลือ แล้วจบ
+			for _, t := range stillPending {
+				finalAmps[t.key] = share
+			}
+			break
+		}
+
+		pending = stillPending
+		if len(pending) == 0 {
+			break
+		}
 	}
+
+	fmt.Printf("🔹 [DLB] ผลเกลี่ยไฟหลัง Water-Filling: %v\n", finalAmps)
 
 	var totalAllocated float64
 
-	// 5. จัดสรรกระแสไฟให้หัวชาร์จแต่ละจุด
-	// 🎯 แก้ไข: วนลูปจาก evses เพื่อบันทึกค่าแยกราย Connector เช่น "CS-SIEMENS_1", "CS-SIEMENS_2" จะได้ไม่ทับกัน
+	// 2. กติกาที่ 2: ถ้าไฟที่ได้จริงต่ำกว่า 6A -> ปรับเป็น 0A (สั่ง Pause)
+	// 🎯 ใช้ threshold 6A ต่อ "หัว" แทนการเช็คแค่ค่าเฉลี่ยกลางตัวเดียวแบบเดิม
+	//    เพราะตอนนี้แต่ละหัวได้ไฟไม่เท่ากันแล้วจากการ redistribute
+	for key, amp := range finalAmps {
+		if amp < 6.0 {
+			finalAmps[key] = 0.0
+		}
+	}
+
+	// 3. เขียนผลลัพธ์ลง allocations (คงรูปแบบเดิม: เก็บทั้ง key เต็มและ key แบบสั้น)
 	for key, evse := range evses {
 		isMyBox := false
 		for _, idEvse := range box.IDEVSE {
-			if evse.SerialNumber == idEvse || key == idEvse {
+			if evse.SerialNumber == idEvse.Name || key == idEvse.Name {
 				isMyBox = true
 				break
 			}
 		}
 
-		// ถ้าไม่ใช่ตู้ของกล่องนี้ ให้ข้ามไป
 		if !isMyBox {
 			continue
 		}
 
 		if evse.Status == StatusCharging {
-			targetAmp := allocatedAmps
+			targetAmp := finalAmps[key] // ค่าที่ได้จริงหลัง water-filling + threshold
 
-			// เช็กไม่ให้เกิน MaxAmperes ของหัวชาร์จนั้นๆ
-			if evse.MaxAmperes > 0 && targetAmp > evse.MaxAmperes {
-				targetAmp = evse.MaxAmperes
-			}
-
-			// 🎯 3. บันทึกผลลง Key ของ Connector นั้นๆ (เช่น "CS-SIEMENS_2" จะแยกกันชัดเจน ไม่โดนเขียนทับ)
 			allocations[key] = targetAmp
-			allocations[evse.SerialNumber] = targetAmp // เผื่อต้องการใช้ Key สั้นด้วย
+			allocations[evse.SerialNumber] = targetAmp
 
 			totalAllocated += targetAmp
 		} else {
-			// หัวชาร์จที่ไม่ได้ชาร์จอยู่ ให้โควตา 0A
 			allocations[key] = 0.0
 			allocations[evse.SerialNumber] = 0.0
 		}

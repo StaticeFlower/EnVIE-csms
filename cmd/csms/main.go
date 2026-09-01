@@ -20,10 +20,11 @@ type UpdateNowAmpDTO struct {
 }
 
 // DTO สำหรับลงทะเบียน ENBox ใหม่ลง RAM
+// 🎯 แก้ให้ตรงกับ payload ใหม่: idevse เป็น array ของ {name, max_amp} และเปลี่ยน max_amp -> max_amp_build
 type RegisterBoxDTO struct {
-	AddressEsp32 string   `json:"address_esp32" binding:"required"`
-	IDEVSE       []string `json:"idevse" binding:"required"`
-	MaxAmp       float64 `json:"max_amp,omitempty"`
+	AddressEsp32 string           `json:"address_esp32" binding:"required"`
+	IDEVSE       []dlb.EVSEConfig `json:"idevse" binding:"required"`
+	MaxAmpBuild  float64          `json:"max_amp_build,omitempty"`
 }
 
 func main() {
@@ -63,18 +64,21 @@ func main() {
 				return
 			}
 
+			maxAmpBuild := dto.MaxAmpBuild
+			if maxAmpBuild <= 0 {
+				maxAmpBuild = 32.0 // Default 32A หากไม่ได้ระบุมา
+			}
+
 			box := dlb.ENBox{
 				AddressEsp32: dto.AddressEsp32,
 				IDEVSE:       dto.IDEVSE,
+				MaxAmpBuild:  maxAmpBuild, // 🎯 เก็บลง box ตรงๆ ตามโครงสร้างใหม่
 				NowAmp:       0,
 			}
 
-			maxAmp := dto.MaxAmp
-			if maxAmp <= 0 {
-				maxAmp = 32.0 // Default 32A หากไม่ได้ระบุมา
-			}
-
-			savedBox := memStore.SaveBoxToRam(box, maxAmp)
+			// 🎯 SaveBoxToRam ยังรับ maxAmp แยกอยู่เหมือนเดิม (ไม่แก้ signature/logic ของ store)
+			// ใช้ box.MaxAmpBuild เป็นค่าที่ส่งเข้าไปแทน field max_amp แบบเดิม
+			savedBox := memStore.SaveBoxToRam(box, maxAmpBuild)
 			c.JSON(http.StatusOK, gin.H{
 				"message": "บันทึกข้อมูล ControllerBox ลง RAM สำเร็จ",
 				"data":    savedBox,

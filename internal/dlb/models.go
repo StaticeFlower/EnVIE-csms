@@ -26,11 +26,19 @@ type EVSE struct {
 	MaxAmperes     float64    `json:"max_amperes"`     // โควตาสูงสุดที่หัวชาร์จรับได้
 }
 
-type ENBox struct {
-	AddressEsp32         string        `json:"address_esp32"`
-	IDEVSE          []string           `json:"idevse"`
-	NowAmp			float64            `json:"NowAmp"`
+type EVSEConfig struct {
+	Name   string  `json:"name"`
+	MaxAmp float64 `json:"max_amp"`
 }
+
+type ENBox struct {
+	AddressEsp32 string       `json:"address_esp32"`
+	IDEVSE       []EVSEConfig `json:"idevse"`        // 🎯 เปลี่ยนจาก []string เป็น []EVSEConfig
+	MaxAmpBuild  float64      `json:"max_amp_build"` // 🎯 เพิ่มใหม่ตาม JSON ที่ต้องการ
+	NowAmp       float64      `json:"NowAmp"`
+}
+
+
 
 // DLBResult ผลลัพธ์การจัดสรรกระแสไฟจากระบบ Dynamic Load Balancing
 type DLBResult struct {

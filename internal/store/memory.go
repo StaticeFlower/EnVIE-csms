@@ -211,13 +211,14 @@ func (m *MemoryStore) UpdateNowAmpAndSendWs(addressEsp32 string, newNowAmp float
 
 	box.NowAmp = newNowAmp
 	m.boxes[addressEsp32] = box
-	boxMaxAmp := m.boxMaxAmps[addressEsp32]
+	// 🎯 ตัด boxMaxAmp ออก เพราะตอนนี้ MaxAmp อยู่ต่อหัวใน box.IDEVSE[i].MaxAmp แล้ว
 	m.mu.Unlock()
 
 	// 1. รวบรวม EVSE Data ปัจจุบันส่งให้ DLB Algorithm คำนวณ
 	m.mu.RLock()
 	evsesMap := make(map[string]*dlb.EVSE)
-	for _, sn := range box.IDEVSE {
+	for _, idEvse := range box.IDEVSE { // 🎯 วนเป็น EVSEConfig แทน string
+		sn := idEvse.Name
 		if charger, found := m.chargerSockets[sn]; found {
 			for connID, status := range charger.Connectors {
 				key := fmt.Sprintf("%s_%d", sn, connID)
@@ -225,7 +226,7 @@ func (m *MemoryStore) UpdateNowAmpAndSendWs(addressEsp32 string, newNowAmp float
 					SerialNumber: sn,
 					ConnectorID:  connID,
 					Status:       status,
-					MaxAmperes:   boxMaxAmp,
+					MaxAmperes:   idEvse.MaxAmp, // 🎯 ใช้ MaxAmp รายหัวจาก config แทน boxMaxAmp
 				}
 			}
 		}
@@ -235,7 +236,6 @@ func (m *MemoryStore) UpdateNowAmpAndSendWs(addressEsp32 string, newNowAmp float
 	// 2. เรียกใช้ Pure Logic DLB Algorithm
 	dlbRes := dlb.CalculateDLB(buildingCap, box, evsesMap)
 
-	// 3. 🎯 คัดลอกเป้าหมายที่จะยิงออกมาก่อนภายใต้ RLock
 	type chargerTarget struct {
 		sn     string
 		connID int
@@ -245,7 +245,8 @@ func (m *MemoryStore) UpdateNowAmpAndSendWs(addressEsp32 string, newNowAmp float
 	var targets []chargerTarget
 
 	m.mu.RLock()
-	for _, sn := range box.IDEVSE {
+	for _, idEvse := range box.IDEVSE { // 🎯 วนเป็น EVSEConfig แทน string
+		sn := idEvse.Name
 		if charger, found := m.chargerSockets[sn]; found {
 			for connID, status := range charger.Connectors {
 				targets = append(targets, chargerTarget{
@@ -256,9 +257,8 @@ func (m *MemoryStore) UpdateNowAmpAndSendWs(addressEsp32 string, newNowAmp float
 			}
 		}
 	}
-	m.mu.RUnlock() // 🔓 ปลดล็อก MemoryStore ทันที ก่อนเริ่มยิง WebSocket เพื่อแก้ Deadlock
+	m.mu.RUnlock()
 
-	// 4. วนลูปยิงคำสั่ง SetChargingProfile นอก Lock
 	var results []DLBExecutionResult
 	activeCount := 0
 
@@ -316,7 +316,8 @@ func (m *MemoryStore) GetAllFromRam() []map[string]interface{} {
 	for espAddr, box := range m.boxes {
 		var chargersInfo []map[string]interface{}
 
-		for _, sn := range box.IDEVSE {
+		for _, idEvse := range box.IDEVSE { // 🎯 วนเป็น EVSEConfig แทน string
+			sn := idEvse.Name
 			if charger, exists := m.chargerSockets[sn]; exists {
 				isOnline := charger.Conn != nil
 				chargersInfo = append(chargersInfo, map[string]interface{}{
@@ -338,7 +339,7 @@ func (m *MemoryStore) GetAllFromRam() []map[string]interface{} {
 			"address_esp32": espAddr,
 			"idevse":        box.IDEVSE,
 			"NowAmp":        box.NowAmp,
-			"MaxAmp":        m.boxMaxAmps[espAddr],
+			"MaxAmp":        m.boxMaxAmps[espAddr], // ยังคงไว้เผื่อ endpoint อื่นใช้ (ดูหมายเหตุด้านล่าง)
 			"chargers":      chargersInfo,
 		})
 	}
